@@ -225,12 +225,15 @@ def _load_list(path: Path) -> list[dict[str, Any]]:
 # confirmation; safe skills can run directly with the same profile-aware agent
 # path used by the CLI/Web entry points.
 _SKILL_CONFIRM_MARKERS = (
-    "publish", "upload", "comment-reply", "community-ops", "livestream",
-    "profile-manager", "cross-platform-publish", "wechat-publisher", "voice-clone",
+    "upload", "publisher", "comment-reply", "community-ops", "livestream",
+    "cross-platform-publish", "publish-scheduler", "profile-manager", "voice-clone",
 )
+# Only skills with real platform side-effects sit behind the host publish gate.
+# Scheduling/log/checklist/analytics skills are internal write ops: they need a
+# one-time confirmation but must stay runnable while the publish gate is closed.
 _SKILL_GATE_MARKERS = (
-    "publish", "upload", "comment-reply", "community-ops", "livestream",
-    "cross-platform-publish", "wechat-publisher",
+    "upload", "publisher", "comment-reply", "community-ops", "livestream",
+    "cross-platform-publish",
 )
 _SHARED_ROOT = Path(os.environ.get("EASEL_SHARED_ROOT", str(PROJECT_ROOT / "shared"))).expanduser().resolve()
 _SKILL_INPUT_ROOTS = tuple({p.resolve() for p in (PROJECT_ROOT, OUTPUTS, PROFILES, _SHARED_ROOT)})

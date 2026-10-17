@@ -25,9 +25,19 @@ Hermes 任意 bot
 
 ### 全技能路由
 
-Easel 的 114 个内置技能可以通过统一的 `easel_run_skill` 调用，仍复用 Easel 原有 `easel skill` 路由，而不是暴露任意 shell。先用 `easel_skill_policy` 查看风险；上传、发布、评论、账号/画像修改、直播和声音克隆等高风险技能必须先调用 `easel_request_skill_confirmation`，确认凭证绑定完整的技能名、输入和画像，10 分钟过期且只能使用一次。上传/发布类技能还额外受主机 `EASEL_MCP_ALLOW_PUBLISH` 闸控制，闸关闭时直接 `blocked`，无法申请确认。
+Easel 的 114 个内置技能可以通过统一的 `easel_run_skill` 调用，仍复用 Easel 原有 `easel skill` 路由，而不是暴露任意 shell。先用 `easel_skill_policy` 查看风险；上传、发布、评论、账号/画像修改、直播和声音克隆等高风险技能必须先调用 `easel_request_skill_confirmation`，确认凭证绑定完整的技能名、输入和画像，10 分钟过期且只能使用一次。
+
+风险分两级，实测分类（`easel_skill_policy` 可查）：
+
+- **主机发布闸**（11 个）：`skill-bilibili-upload`、`skill-channels-upload`、`skill-douyin-upload`、`skill-kuaishou-upload`、`skill-xhs-publisher`、`skill-zhihu-publisher`、`skill-wechat-publisher`、`skill-cross-platform-publish`、`skill-xhs-comment-reply`、`skill-community-ops`、`skill-livestream`。闸关闭时直接 `blocked`，连确认凭证都申请不到。
+- **仅需一次性确认**（3 个）：`skill-publish-scheduler`、`skill-profile-manager`、`voice-clone`。排期/日志/清单/复盘类技能属于内部写操作，发布闸关闭时仍可运行，但要确认。
+- 其余 100 个技能为只读或纯生成类，可直接运行。
 
 技能输入可以是文本，也可以是 Easel 项目、`outputs/`、`profiles/` 或 `EASEL_SHARED_ROOT` 指向共享目录内的文件路径；其他本机文件路径会被拒绝。输出会做敏感信息过滤并保留退出码/未知状态。
+
+### 已知行为（实测）
+
+内置 agent 类技能（如 `copywriting`）在 MCP 子进程里跑的是同一套 Easel agent 链路，生成内容正常返回，但**落盘需要审批**：非交互子进程拿不到 ACP 审批，写文件会被拒，技能以退出码 1 结束，内容仍在 `output` 里。要让技能直接写共享库，需在 Easel Web / ACP 会话里批准，或由调用方把返回内容另行落盘。这不是 MCP 路由失败。
 
 ## 工具分层
 
@@ -84,7 +94,7 @@ hermes mcp test easel
 ✓ Tools discovered: 31
 
 C:/Python314/python.exe -m pytest tests/test_easel_mcp_server.py -q
-11 passed
+12 passed
 ```
 
 独立 stdio client 已完成 initialize、tools/list、`easel_status`、`easel_plan_publish` 往返验证。

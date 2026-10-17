@@ -61,6 +61,17 @@ def test_publish_class_skill_cannot_be_confirmed_while_gate_is_closed():
     assert "EASEL_MCP_ALLOW_PUBLISH" in result["error"]
 
 
+def test_internal_publish_workflow_skills_are_not_host_gated():
+    # Scheduler/log/checklist skills are internal write ops: they stay runnable
+    # while the real publish gate is closed, but still require a confirmation.
+    scheduler = json.loads(server.easel_skill_policy("publish-scheduler"))
+    assert scheduler["requires_confirmation"] is True
+    assert server._skill_requires_publish_gate("skill-publish-scheduler") is False
+    upload = json.loads(server.easel_skill_policy("skill-bilibili-upload"))
+    assert upload["requires_confirmation"] is True
+    assert server._skill_requires_publish_gate("skill-bilibili-upload") is True
+
+
 def test_all_builtin_skills_are_listed_and_high_risk_policy_is_explicit():
     result = json.loads(server.easel_list_skills())
     assert result["ok"] is True
