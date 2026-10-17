@@ -6,7 +6,7 @@
 - 传输：本机 stdio
 - Hermes 配置：`~/.hermes/config.yaml` 的 `mcp_servers.easel`
 - MCP SDK：Easel `.venv` 中 `mcp 1.30.0`
-- 已发现工具：28 个
+- 已发现工具：31 个
 - Easel Web：仍可保留在 `127.0.0.1:7860`，作为人工排查/扫码后台；MCP 不依赖 Web 端口
 
 ## 调用关系
@@ -22,6 +22,12 @@ Hermes 任意 bot
 ```
 
 这不是 Easel ACP 单 bot 连接，也不需要新建 `easel` bot；所有已授权的 Hermes bot 都可以发现同一组 MCP 工具。是否让某个 bot 实际调用，仍由该 bot 的工具集和任务边界决定。
+
+### 全技能路由
+
+Easel 的 114 个内置技能可以通过统一的 `easel_run_skill` 调用，仍复用 Easel 原有 `easel skill` 路由，而不是暴露任意 shell。先用 `easel_skill_policy` 查看风险；上传、发布、评论、账号/画像修改、直播和声音克隆等高风险技能必须先调用 `easel_request_skill_confirmation`，确认凭证绑定完整的技能名、输入和画像，10 分钟过期且只能使用一次。上传/发布类技能还额外受主机 `EASEL_MCP_ALLOW_PUBLISH` 闸控制，闸关闭时直接 `blocked`，无法申请确认。
+
+技能输入可以是文本，也可以是 Easel 项目、`outputs/`、`profiles/` 或 `EASEL_SHARED_ROOT` 指向共享目录内的文件路径；其他本机文件路径会被拒绝。输出会做敏感信息过滤并保留退出码/未知状态。
 
 ## 工具分层
 
@@ -48,20 +54,37 @@ MCP 默认不满足第 1 条，因此真实发布默认被阻断。发布脚本�
 ## 明确禁止
 
 - 不暴露 cookie、密码、AppSecret、token、环境变量或原始凭据文件；
-- 不提供任意 shell、任意 Python 或任意文件写入工具；
+- 不提供任意 shell、任意 Python 或任意文件写入工具；`easel_run_skill` 只能调用已安装 Easel 技能，不能拼任意命令；
 - 不通过 MCP 自动扫码、导入 cookie、删除浏览器 profile 或修改平台账号；
+- 上传/发布类技能未经主机发布闸允许时不得执行；
 - 不把 Web API 的启动状态当作发布成功；
 - 不开放局域网 HTTP MCP 端点；当前只用本机 stdio。
+
+## Hermes 侧配置
+
+除默认 `mcp_servers.easel` 外，各 bot profile（`radar`/`director`/`design`/`huasheng`/`qianfan`/`collector`）写入同一 server，并附带：
+
+```yaml
+mcp_servers:
+  easel:
+    command: D:/Garyai/opensource/Easel/.venv/Scripts/python.exe
+    args: [D:/Garyai/opensource/Easel/easel_mcp_server.py]
+    enabled: true
+    timeout: 180
+    connect_timeout: 30
+    env:
+      EASEL_SHARED_ROOT: D:/Garyai/Token纪年视频创作/shared
+```
 
 ## 验收记录
 
 ```text
 hermes mcp test easel
 ✓ Connected
-✓ Tools discovered: 28
+✓ Tools discovered: 31
 
 C:/Python314/python.exe -m pytest tests/test_easel_mcp_server.py -q
-5 passed
+11 passed
 ```
 
 独立 stdio client 已完成 initialize、tools/list、`easel_status`、`easel_plan_publish` 往返验证。

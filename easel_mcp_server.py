@@ -44,6 +44,10 @@ CONFIRM_FILE = MCP_DIR / "confirmations.json"
 SCHEDULE_FILE = OUTPUTS / "_schedule.json"
 IDEAS_FILE = OUTPUTS / "_ideas.json"
 
+# The publish gate is environment-driven so a bot session can never widen it.
+# Only the host process that launches this MCP server may enable real publishing.
+PUBLISH_ENABLED = os.environ.get("EASEL_MCP_ALLOW_PUBLISH") == "1"
+
 # This is metadata only. No cookie values or credential fields are returned.
 ACCOUNT_CONFIG: dict[str, dict[str, Any]] = {
     "xiaohongshu": {"name": "小红书", "backend": "xhs", "profile": "XiaohongshuProfile", "analytics": True},
@@ -216,12 +220,123 @@ def _load_list(path: Path) -> list[dict[str, Any]]:
     return value if isinstance(value, list) else []
 
 
+# Skill execution is exposed through Easel's existing skill router rather than
+# an arbitrary shell tool.  High-risk skills still need a payload-bound one-time
+# confirmation; safe skills can run directly with the same profile-aware agent
+# path used by the CLI/Web entry points.
+_SKILL_CONFIRM_MARKERS = (
+    "publish", "upload", "comment-reply", "community-ops", "livestream",
+    "profile-manager", "cross-platform-publish", "wechat-publisher", "voice-clone",
+)
+_SKILL_GATE_MARKERS = (
+    "publish", "upload", "comment-reply", "community-ops", "livestream",
+    "cross-platform-publish", "wechat-publisher",
+)
+_SHARED_ROOT = Path(os.environ.get("EASEL_SHARED_ROOT", str(PROJECT_ROOT / "shared"))).expanduser().resolve()
+_SKILL_INPUT_ROOTS = tuple({p.resolve() for p in (PROJECT_ROOT, OUTPUTS, PROFILES, _SHARED_ROOT)})
+
+
+def _resolve_skill(name: str) -> str:
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", name):
+        raise ValueError("技能名称格式无效")
+    candidates = [name] if name.startswith("skill-") else [name, f"skill-{name}"]
+    for candidate in candidates:
+        if (BUILTIN_SKILLS / candidate / "SKILL.md").is_file():
+            return candidate
+    raise ValueError("技能不存在")
+
+
+def _skill_requires_confirmation(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SKILL_CONFIRM_MARKERS)
+
+
+def _skill_requires_publish_gate(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SKILL_GATE_MARKERS)
+
+
+def _validate_skill_input(raw_input: str) -> str:
+    if not isinstance(raw_input, str) or not raw_input.strip():
+        raise ValueError("技能输入不能为空")
+    if len(raw_input) > 120_000:
+        raise ValueError("技能输入过大")
+    candidate = Path(raw_input).expanduser()
+    # Easel's CLI accepts a path as input. Keep that feature, but do not let an
+    # MCP caller ask the skill agent to ingest arbitrary home/system files.
+    if candidate.is_absolute() or candidate.is_file():
+        resolved = candidate.resolve(strict=False)
+        if not any(root == resolved or root in resolved.parents for root in _SKILL_INPUT_ROOTS):
+            raise ValueError("输入文件必须位于 Easel 项目、outputs 或 profiles 内")
+    return raw_input
+
+
+def easel_skill_policy(name: str) -> str:
+    """返回技能的 MCP 执行策略，不执行技能。"""
+    try:
+        full = _resolve_skill(name)
+        return _result(skill=full, requires_confirmation=_skill_requires_confirmation(full),
+                       confirmation_kind="skill_run", input_roots=[str(p) for p in _SKILL_INPUT_ROOTS])
+    except Exception as exc:
+        return _result(False, error=_safe_error(exc))
+
+
+def easel_request_skill_confirmation(skill_name: str, input_text: str, profile: str = "") -> str:
+    """为高风险技能执行申请一次性、payload 绑定的确认凭证。"""
+    try:
+        full = _resolve_skill(skill_name)
+        content = _validate_skill_input(input_text)
+        if profile and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile):
+            raise ValueError("画像名称格式无效")
+        if _skill_requires_publish_gate(full) and not PUBLISH_ENABLED:
+            return _result(False, state="blocked", skill=full, publish_enabled=False,
+                           error="该技能会真实发布或上传到平台；主机未启用 EASEL_MCP_ALLOW_PUBLISH，已阻断")
+        payload = {"skill": full, "input": content, "profile": profile}
+        confirmation = _issue_confirmation("skill_run", payload)
+        return _result(skill=full, requires_confirmation=_skill_requires_confirmation(full), **confirmation)
+    except Exception as exc:
+        return _result(False, error=_safe_error(exc))
+
+
+def easel_run_skill(skill_name: str, input_text: str, profile: str = "", confirmation_id: str = "") -> str:
+    """运行任一已安装 Easel 技能；高风险技能必须先确认，禁止任意 shell。"""
+    try:
+        full = _resolve_skill(skill_name)
+        content = _validate_skill_input(input_text)
+        if profile and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile):
+            raise ValueError("画像名称格式无效")
+        payload = {"skill": full, "input": content, "profile": profile}
+        if _skill_requires_publish_gate(full) and not PUBLISH_ENABLED:
+            return _result(False, state="blocked", skill=full, publish_enabled=False,
+                           error="该技能会真实发布或上传到平台；主机未启用 EASEL_MCP_ALLOW_PUBLISH，已阻断")
+        if _skill_requires_confirmation(full):
+            if not confirmation_id:
+                return _result(False, state="blocked", skill=full,
+                               error="该技能属于高风险能力；请先调用 easel_request_skill_confirmation")
+            _consume_confirmation(confirmation_id, "skill_run", payload)
+        cmd = [sys.executable, "-m", "easel", "skill", full, "--input", content]
+        if profile:
+            cmd.extend(["--profile", profile])
+        rc, stdout, stderr = _run(cmd, timeout=900)
+        return _result(rc == 0, state="completed" if rc == 0 else "failed", skill=full,
+                       profile=profile or None, exit_code=rc,
+                       output=_redact_text(stdout), diagnostics=_redact_text(stderr))
+    except subprocess.TimeoutExpired:
+        return _result(False, state="unknown", skill=skill_name, error="技能执行超时，结果未知")
+    except Exception as exc:
+        return _result(False, state="failed", error=_safe_error(exc))
+
+
+def _redact_text(value: str, limit: int = 12000) -> str:
+    return _SECRET_RE.sub("[REDACTED]", str(value or ""))[:limit]
+
+
 # --------------------------- read-only tools ---------------------------
 
 def easel_status() -> str:
     """返回 Easel MCP 集成状态、版本路径和安全能力开关，不返回凭据。"""
     return _result(project=str(PROJECT_ROOT), outputs_exists=OUTPUTS.is_dir(),
-                   mcp_server="easel", protocol="stdio", publish_enabled=os.environ.get("EASEL_MCP_ALLOW_PUBLISH") == "1",
+                   mcp_server="easel", protocol="stdio", publish_enabled=PUBLISH_ENABLED,
                    write_confirmations=True, raw_shell=False, raw_credentials=False,
                    supported_platforms=list(DISPATCH_PLATFORMS))
 
@@ -401,7 +516,7 @@ def easel_get_publish_policy() -> str:
     """返回发布模式和 MCP 高风险闸状态。"""
     mode = os.environ.get("EASEL_PUBLISH_MODE", "automated").strip().lower() or "automated"
     return _result(mode=mode if mode in {"automated", "manual"} else "manual",
-                   mcp_publish_enabled=os.environ.get("EASEL_MCP_ALLOW_PUBLISH") == "1",
+                   mcp_publish_enabled=PUBLISH_ENABLED,
                    confirmation_required=True, result_verification="publisher_exit_code_only")
 
 
@@ -491,7 +606,7 @@ def easel_publish(platform: str, title: str, body: str, media: list[str] | None 
     """执行一次真实发布；默认禁用，必须显式启用 MCP 发布闸并提供未使用确认凭证。"""
     payload = {"platform": platform, "title": title or "", "body": body or "", "media": media or [], "tags": tags or ""}
     try:
-        if os.environ.get("EASEL_MCP_ALLOW_PUBLISH") != "1":
+        if not PUBLISH_ENABLED:
             raise PermissionError("MCP 真实发布闸未开启；当前仅可做计划、人工导出和状态查询")
         _consume_confirmation(confirmation_id, "publish", payload)
         cmd = _publish_command(platform, title or "", body or "", tags or "", media or [])
@@ -694,10 +809,12 @@ def _build_server() -> Any:
         "require a one-time confirmation. Real publishing is disabled unless the host "
         "explicitly enables EASEL_MCP_ALLOW_PUBLISH=1 and supplies a confirmation id. "
         "Never request or expose cookies, passwords, tokens or raw shell execution. "
-        "Unknown publication state must remain unknown."
+        "Unknown publication state must remain unknown. Skill execution is available through "
+        "easel_run_skill; high-risk skills require easel_request_skill_confirmation."
     )
     tools = [
         easel_status, easel_list_personas, easel_read_persona, easel_list_skills, easel_read_skill,
+        easel_skill_policy, easel_request_skill_confirmation, easel_run_skill,
         easel_list_outputs, easel_read_output, easel_list_accounts, easel_login_status, easel_check_account,
         easel_fetch_analytics, easel_get_publish_policy, easel_plan_publish, easel_request_manual_export,
         easel_export_manual_package, easel_request_publish_confirmation, easel_publish, easel_publish_status,
