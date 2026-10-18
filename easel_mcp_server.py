@@ -201,14 +201,23 @@ def _account_fast_status(platform: str, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run(cmd: list[str], *, timeout: int = 120, env: Optional[dict[str, str]] = None) -> tuple[int, str, str]:
-    """Run only an explicitly constructed Easel script command."""
+    """Run only an explicitly constructed Easel script command.
+
+    ``stdin`` is pinned to DEVNULL.  This server's own stdin is the MCP stdio
+    protocol pipe, and a child that inherits it blocks forever waiting on a
+    stream that will never deliver data or EOF — measured at a 30 s timeout
+    with zero bytes of child output, while the identical command with
+    ``stdin=DEVNULL`` returns in 0.13 s.  Easel scripts are argv-driven CLI
+    tools and never read stdin, so nothing is lost by closing it.
+    """
     merged = dict(os.environ)
     merged.update(env or {})
     merged.setdefault("PYTHONUTF8", "1")
     merged.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         p = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=merged, capture_output=True,
-                           text=True, encoding="utf-8", timeout=timeout)
+                           text=True, encoding="utf-8", timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired as exc:
         raise _SubprocessTimeout(f"Easel 子程序超时（{timeout}s）") from exc
@@ -217,16 +226,46 @@ def _run(cmd: list[str], *, timeout: int = 120, env: Optional[dict[str, str]] = 
 
 
 def _last_json(stdout: str) -> dict[str, Any] | None:
+    """Extract the last JSON object a script printed on stdout.
+
+    Easel scripts emit ``json.dumps(..., indent=2)`` — a pretty-printed object
+    whose first line is a bare ``{``.  The previous line-by-line scan demanded a
+    line that both starts with ``{`` and parses standalone, which pretty output
+    can never satisfy, so every multi-line payload decoded to ``None`` and the
+    caller silently substituted an empty dict.
+    """
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+
+    # Fast path: a compact object on one line, tolerating leading log lines.
     for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
+        stripped = line.strip()
+        if stripped.startswith("{"):
             try:
-                value = json.loads(line)
-                if isinstance(value, dict):
-                    return value
+                value = json.loads(stripped)
             except json.JSONDecodeError:
-                continue
-    return None
+                break  # pretty-printed — fall through to the span decoder
+            if isinstance(value, dict):
+                return value
+
+    # Pretty path: decode from each line that is a bare "{" at column 0 (the
+    # start of a top-level object). Requiring column 0 matters: in nested pretty
+    # output an inner object's opening brace is indented, and decoding from
+    # there would return the inner object instead of the whole payload.
+    decoder = json.JSONDecoder()
+    offset = 0
+    found: dict[str, Any] | None = None
+    for line in stdout.splitlines(keepends=True):
+        if line.rstrip("\r\n") == "{":
+            try:
+                value, _ = decoder.raw_decode(stdout, offset)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(value, dict):
+                    found = value
+        offset += len(line)
+    return found
 
 
 def _public_file_name(path: Path) -> str:
@@ -548,7 +587,12 @@ def easel_list_accounts() -> str:
 
 
 def easel_login_status(platform: str = "") -> str:
-    """读取一个或全部平台的登录标记；这是快速状态，不冒充深度身份校验。"""
+    """读取一个或全部平台的登录标记；这是快速状态，不冒充深度身份校验。
+
+    返回的 ``logged_in`` 只说明存在一个「成功」标记文件或 cookie 文件，**不代表
+    cookie 仍然有效**。要看真实可用性必须调 ``easel_check_account`` 做深验；
+    每一行都带 ``deep_verified: false`` 和 ``verification`` 说明这个状态是怎么来的。
+    """
     platform = _as_text(platform)
     if platform and platform not in ACCOUNT_CONFIG:
         return _result(False, error="未知平台")
@@ -557,7 +601,15 @@ def easel_login_status(platform: str = "") -> str:
     for pf in targets:
         cfg = ACCOUNT_CONFIG[pf]
         s = _account_fast_status(pf, cfg)
-        rows.append({"platform": pf, "name": cfg["name"], **s, "verification": "marker_or_file_presence_only"})
+        rows.append({
+            "platform": pf,
+            "name": cfg["name"],
+            **s,
+            "deep_verified": False,
+            "verification": "marker_or_file_presence_only",
+            "usable_unknown": True,
+            "note": "标记存在≠cookie 有效；真实可用性需 easel_check_account 深验",
+        })
     return _result(accounts=rows)
 
 
@@ -772,9 +824,15 @@ def _write_payload(operation: str, payload: dict[str, Any], token: str) -> None:
 
 
 def easel_list_schedule() -> str:
-    """读取 Easel 排期。"""
+    """读取 Easel 排期。
+
+    数据源是 ``outputs/_schedule.json``。**这个文件不存在时返回空列表，并且
+    ``source_exists`` 为 false** —— 空列表不等于「没有排期」，只等于「Easel
+    侧没有维护这个文件」。Token纪年 六 bot 的排期事实源在
+    ``shared/`` 下的 README「最晚发布时间」+ publish-log，两边尚未打通。
+    """
     items = _load_list(SCHEDULE_FILE)
-    return _result(items=items, count=len(items))
+    return _result(items=items, count=len(items), source_exists=SCHEDULE_FILE.is_file())
 
 
 def easel_schedule_context(days: int = 14) -> str:
@@ -839,9 +897,15 @@ def easel_delete_schedule(schedule_id: str, confirmation_id: str = "") -> str:
 
 
 def easel_list_ideas() -> str:
-    """读取选题池。"""
+    """读取选题池。
+
+    数据源是 ``outputs/_ideas.json``。**文件不存在时返回空列表，且
+    ``source_exists`` 为 false** —— 空列表不等于「没有选题」，只等于「Easel
+    侧没有维护这个文件」。Token纪年 的选题事实源是 radar 每日落盘的
+    ``shared/选题/topic-radar-hermes-<日期>.md``，两边尚未打通。
+    """
     items = _load_list(IDEAS_FILE)
-    return _result(items=items, count=len(items))
+    return _result(items=items, count=len(items), source_exists=IDEAS_FILE.is_file())
 
 
 def easel_create_idea(title: str, note: str = "", source: str = "", status: str = "pending", confirmation_id: str = "") -> str:

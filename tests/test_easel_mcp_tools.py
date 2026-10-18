@@ -242,6 +242,89 @@ def test_read_persona_success_and_refusals(env):
     assert "格式无效" in call("easel_read_persona", name="a b")["error"]
 
 
+def test_login_status_marks_itself_unverified(env):
+    """A marker-only 'logged_in' must never read as 'usable'. 2026-10-18:
+    weixin-channels reported logged_in=true from a marker while the cookie
+    was in fact dead, and the only deep check timed out."""
+    rows = call("easel_login_status")["accounts"]
+    assert rows, "expected at least one platform row"
+    for row in rows:
+        assert row["deep_verified"] is False
+        assert row["verification"] == "marker_or_file_presence_only"
+        assert row["usable_unknown"] is True
+        assert "easel_check_account" in row["note"]
+    one = call("easel_login_status", platform="xiaohongshu")["accounts"]
+    assert len(one) == 1 and one[0]["deep_verified"] is False
+
+
+def test_list_schedule_and_ideas_flag_absent_source(env):
+    """Empty must be distinguishable from 'no data source' — a commander
+    reading count=0 as 'nothing scheduled' is the exact failure this guards."""
+    for name in ("easel_list_schedule", "easel_list_ideas"):
+        r = call(name)
+        assert "source_exists" in r, (name, r)
+        assert isinstance(r["source_exists"], bool)
+        if r["count"] == 0:
+            assert r["source_exists"] is False, (name, r)
+
+
+def test_run_pins_stdin_to_devnull(monkeypatch):
+    """The MCP server's stdin is the protocol pipe; a child that inherits it
+    blocks forever (measured: 30 s timeout, zero child output). Pin DEVNULL."""
+    import easel_mcp_server as srv
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        raise srv._SubprocessTimeout("stop")
+
+    monkeypatch.setattr(srv.subprocess, "run", fake_run)
+    with pytest.raises(srv._SubprocessTimeout):
+        srv._run(["python", "-c", "pass"], timeout=5)
+    assert seen.get("stdin") is srv.subprocess.DEVNULL, seen
+
+
+def test_last_json_parses_pretty_printed_multiline(monkeypatch):
+    """calendar_ops emits json.dumps(indent=2); its first line is a bare '{',
+    which the old line scanner could never satisfy."""
+    import easel_mcp_server as srv
+    payload = {"today": "2026-10-18", "window_days": 14, "per_platform": [],
+               "upcoming_schedules": [], "suggestions": ["a", "b"]}
+    pretty = json.dumps(payload, indent=2, ensure_ascii=False)
+    assert srv._last_json(pretty) == payload
+
+    # nested objects must not be mistaken for the top-level object
+    nested = {"today": "x", "rows": [{"a": 1}, {"b": 2}], "n": 1}
+    assert srv._last_json(json.dumps(nested, indent=2, ensure_ascii=False)) == nested
+
+    # an inner object is indented, so it must never win over the top-level one
+    inner_first = {"outer": {"deep": {"deeper": 1}}, "tail": 2}
+    assert srv._last_json(json.dumps(inner_first, indent=2, ensure_ascii=False)) == inner_first
+
+    # CRLF output (Windows pipes) must still parse
+    assert srv._last_json(pretty.replace("\n", "\r\n")) == payload
+
+    # leading log lines before a pretty blob are tolerated
+    noisy = "loading...\nwarn: nothing\n" + json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    assert srv._last_json(noisy) == payload
+
+    # compact single-line still works (fast path)
+    assert srv._last_json("noise\n" + json.dumps(payload)) == payload
+
+    # degenerate inputs
+    assert srv._last_json("") is None
+    assert srv._last_json("   \n  ") is None
+    assert srv._last_json("not json at all") is None
+    assert srv._last_json("[\"a\",\"b\"]") is None       # a list is not a dict
+    assert srv._last_json("{\"broken\": ") is None
+
+
+def test_last_json_prefers_last_object_when_several_emitted():
+    import easel_mcp_server as srv
+    two = (json.dumps({"i": 1}, indent=2) + "\n" + json.dumps({"i": 2}, indent=2) + "\n")
+    assert srv._last_json(two) == {"i": 2}
+
+
 def test_list_skills_returns_real_descriptions_not_frontmatter(env):
     rows = call("easel_list_skills")
     assert rows["count"] == 114
