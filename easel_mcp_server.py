@@ -16,6 +16,7 @@ All logs go to stderr. stdout is reserved for the MCP stdio protocol.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -84,6 +85,58 @@ def _json(value: Any) -> str:
 
 def _safe_error(exc: Any) -> str:
     return _SECRET_RE.sub("[REDACTED]", str(exc))[:500]
+
+
+class _SubprocessTimeout(RuntimeError):
+    """Easel 子程序超过时间预算。
+
+    超时既不是成功也不是失败：结果未知。调用方必须把它报成 ``unknown``，
+    绝不能改写成 ``failed``（看起来像平台拒绝）或 ``blocked``（看起来像策略拒绝）。
+    """
+
+
+def _clamp_int(value: Any, lo: int, hi: int) -> int:
+    """把 MCP 整数参数收敛到 [lo, hi]；无法解析时显式报错，不静默套默认值。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"参数必须是整数：{value!r}") from exc
+    return max(lo, min(number, hi))
+
+
+def _as_text(value: Any) -> str:
+    """MCP 客户端可能传来非字符串；畸形输入显式报错，不静默忽略。"""
+    if not isinstance(value, str):
+        raise TypeError(f"参数必须是字符串，收到 {type(value).__name__}")
+    return value
+
+
+_CREDENTIAL_KEY = re.compile(r"(?i)cookie|token|password|secret|sessdata|credential")
+
+
+def _strip_credentials(value: Any) -> Any:
+    """递归剔除输出中的凭据字段；只删键，不动业务数据。"""
+    if isinstance(value, dict):
+        return {k: _strip_credentials(v) for k, v in value.items() if not _CREDENTIAL_KEY.search(str(k))}
+    if isinstance(value, list):
+        return [_strip_credentials(v) for v in value]
+    return value
+
+
+def _json_errors(fn: Any) -> Any:
+    """把参数形态错误收敛成 ``ok=False`` 的 JSON 信封。
+
+    MCP 传输层本来也会兜住异常，但直接调用（测试、其他集成）必须拿到同样的
+    契约：畸形参数永远是一句可读的错误，不是堆栈。只捕获参数形态错误，
+    真正的程序缺陷仍然照常抛出。
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            return fn(*args, **kwargs)
+        except (TypeError, ValueError) as exc:
+            return _result(False, error=_safe_error(exc))
+    return wrapper
 
 
 def _result(ok: bool = True, **data: Any) -> str:
@@ -158,7 +211,7 @@ def _run(cmd: list[str], *, timeout: int = 120, env: Optional[dict[str, str]] = 
                            text=True, encoding="utf-8", timeout=timeout)
         return p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Easel 子程序超时（{timeout}s）") from exc
+        raise _SubprocessTimeout(f"Easel 子程序超时（{timeout}s）") from exc
     except FileNotFoundError as exc:
         raise RuntimeError(f"Easel 依赖不存在：{Path(str(exc.filename or '')).name}") from exc
 
@@ -324,8 +377,9 @@ def easel_run_skill(skill_name: str, input_text: str, profile: str = "", confirm
         return _result(rc == 0, state="completed" if rc == 0 else "failed", skill=full,
                        profile=profile or None, exit_code=rc,
                        output=_redact_text(stdout), diagnostics=_redact_text(stderr))
-    except subprocess.TimeoutExpired:
-        return _result(False, state="unknown", skill=skill_name, error="技能执行超时，结果未知")
+    except _SubprocessTimeout as exc:
+        # 超时不能算失败：可能已经产生副作用，状态保持未知
+        return _result(False, state="unknown", skill=skill_name, error=_safe_error(exc))
     except Exception as exc:
         return _result(False, state="failed", error=_safe_error(exc))
 
@@ -364,7 +418,8 @@ def easel_list_personas() -> str:
 
 def easel_read_persona(name: str) -> str:
     """读取一个画像的非敏感 Markdown 配置文件。"""
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""):
+    name = _as_text(name)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
         return _result(False, error="画像名称格式无效")
     d = (PROFILES / name).resolve()
     if PROFILES.resolve() not in d.parents or not d.is_dir():
@@ -377,7 +432,7 @@ def easel_read_persona(name: str) -> str:
 
 def easel_list_skills(query: str = "") -> str:
     """列出 Easel 内置技能；可按名称过滤。"""
-    q = (query or "").lower().strip()
+    q = _as_text(query).lower().strip()
     rows = []
     for p in sorted(BUILTIN_SKILLS.iterdir()) if BUILTIN_SKILLS.is_dir() else []:
         if not p.is_dir() or (q and q not in p.name.lower()):
@@ -395,7 +450,8 @@ def easel_list_skills(query: str = "") -> str:
 
 def easel_read_skill(name: str) -> str:
     """读取一个 Easel 技能说明文件，不执行技能脚本。"""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", name or ""):
+    name = _as_text(name)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", name):
         return _result(False, error="技能名称格式无效")
     p = (BUILTIN_SKILLS / name / "SKILL.md").resolve()
     if BUILTIN_SKILLS.resolve() not in p.parents or not p.is_file():
@@ -405,9 +461,9 @@ def easel_read_skill(name: str) -> str:
 
 def easel_list_outputs(prefix: str = "", limit: int = 200) -> str:
     """列出内容库中的安全输出文件；系统目录和凭据样文件不返回。"""
-    limit = max(1, min(int(limit or 200), 500))
+    limit = _clamp_int(limit, 1, 500)
     root = OUTPUTS.resolve()
-    q = (prefix or "").strip().replace("\\", "/")
+    q = _as_text(prefix).strip().replace("\\", "/")
     rows = []
     for p in sorted(root.rglob("*")) if root.is_dir() else []:
         if not p.is_file() or root not in p.parents:
@@ -428,14 +484,16 @@ def easel_list_outputs(prefix: str = "", limit: int = 200) -> str:
 def easel_read_output(path: str, max_chars: int = 30000) -> str:
     """读取内容库中的文本产物；禁止读取系统目录、二进制和凭据文件。"""
     try:
-        p = _safe_output(path)
+        p = _safe_output(_as_text(path))
     except ValueError as exc:
         return _result(False, error=str(exc))
     if _public_file_name(p) == "[REDACTED]":
         return _result(False, error="拒绝读取疑似凭据文件")
     if p.suffix.lower() not in {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".html"}:
         return _result(False, error="仅允许读取文本产物")
-    return _result(path=p.relative_to(OUTPUTS).as_posix(), content=p.read_text(encoding="utf-8", errors="replace")[:max(100, min(int(max_chars or 30000), 100000))])
+    budget = _clamp_int(max_chars, 100, 100000)
+    return _result(path=p.relative_to(OUTPUTS).as_posix(),
+                   content=p.read_text(encoding="utf-8", errors="replace")[:budget])
 
 
 def easel_list_accounts() -> str:
@@ -450,6 +508,7 @@ def easel_list_accounts() -> str:
 
 def easel_login_status(platform: str = "") -> str:
     """读取一个或全部平台的登录标记；这是快速状态，不冒充深度身份校验。"""
+    platform = _as_text(platform)
     if platform and platform not in ACCOUNT_CONFIG:
         return _result(False, error="未知平台")
     targets = [platform] if platform else list(ACCOUNT_CONFIG)
@@ -463,6 +522,7 @@ def easel_login_status(platform: str = "") -> str:
 
 def easel_check_account(platform: str, force: bool = False) -> str:
     """对一个平台做只读身份/登录检查；不会登录、改 profile 或发布。"""
+    platform = _as_text(platform)
     if platform not in ACCOUNT_CONFIG:
         return _result(False, error="未知平台")
     cfg = ACCOUNT_CONFIG[platform]
@@ -483,16 +543,19 @@ def easel_check_account(platform: str, force: bool = False) -> str:
         rc, out, err = _run(cmd, timeout=90)
         data = _last_json(out)
         if isinstance(data, dict):
-            data.pop("cookies", None)
-            data.pop("token", None)
-            return _result(platform=platform, return_code=rc, **data)
+            # Recursive strip: platform scripts have historically emitted
+            # session fields under several different key names.
+            return _result(platform=platform, return_code=rc, **_strip_credentials(data))
         return _result(False, platform=platform, return_code=rc, state="unknown", error=_safe_error(err or out)[-500:])
+    except _SubprocessTimeout as exc:
+        return _result(False, platform=platform, state="unknown", error=_safe_error(exc))
     except Exception as exc:
         return _result(False, platform=platform, state="unknown", error=_safe_error(exc))
 
 
 def easel_fetch_analytics(platform: str) -> str:
     """读取一个平台的创作数据；只读，会更新 Easel 的分析快照。"""
+    platform = _as_text(platform)
     cfg = ACCOUNT_CONFIG.get(platform)
     if not cfg or not cfg.get("analytics"):
         return _result(False, error="该平台暂不支持分析")
@@ -508,11 +571,15 @@ def easel_fetch_analytics(platform: str) -> str:
         rc, out, err = _run(cmd, timeout=180)
         data = _last_json(out)
         if not isinstance(data, dict):
-            return _result(False, platform=platform, return_code=rc, error=_safe_error(err or out)[-500:])
-        return _result(rc == 0 and not data.get("error"), platform=platform, return_code=rc, data=data,
+            return _result(False, platform=platform, return_code=rc, state="unknown",
+                           error=_safe_error(err or out)[-500:])
+        return _result(rc == 0 and not data.get("error"), platform=platform, return_code=rc,
+                       data=_strip_credentials(data),
                        error=_safe_error(data.get("error", "")) if data.get("error") else "")
+    except _SubprocessTimeout as exc:
+        return _result(False, platform=platform, state="unknown", error=_safe_error(exc))
     except Exception as exc:
-        return _result(False, platform=platform, error=_safe_error(exc))
+        return _result(False, platform=platform, state="unknown", error=_safe_error(exc))
 
 
 def easel_get_publish_policy() -> str:
@@ -610,7 +677,11 @@ def easel_publish(platform: str, title: str, body: str, media: list[str] | None 
     payload = {"platform": platform, "title": title or "", "body": body or "", "media": media or [], "tags": tags or ""}
     try:
         if not PUBLISH_ENABLED:
-            raise PermissionError("MCP 真实发布闸未开启；当前仅可做计划、人工导出和状态查询")
+            raise PermissionError(
+                "MCP 真实发布闸未开启（主机需设置 EASEL_MCP_ALLOW_PUBLISH=1）；当前仅可做计划、人工导出和状态查询")
+        # 先校验素材再消耗确认凭证：请求本来就跑不了时，不该把一次性凭证烧掉
+        for rel in payload["media"]:
+            _safe_media(_as_text(rel))
         _consume_confirmation(confirmation_id, "publish", payload)
         cmd = _publish_command(platform, title or "", body or "", tags or "", media or [])
         rc, out, err = _run(cmd, timeout=900, env={"EASEL_CALENDAR_AUTORECORD": "0"})
@@ -618,13 +689,23 @@ def easel_publish(platform: str, title: str, body: str, media: list[str] | None 
         # rc != 0 is never rewritten to success. Platform readback remains a separate unknown state.
         return _result(rc == 0, platform=platform, state="submitted" if rc == 0 else "failed",
                        verified=False, verification="unknown_requires_platform_readback", return_code=rc, detail=detail)
-    except Exception as exc:
+    except PermissionError as exc:
+        # 策略拒绝：闸未开或确认凭证不匹配
         return _result(False, platform=platform, state="blocked", error=_safe_error(exc))
+    except _SubprocessTimeout as exc:
+        # 超时≠拒绝，结果未知
+        return _result(False, platform=platform, state="unknown", error=_safe_error(exc))
+    except Exception as exc:
+        # 参数/素材校验等失败：明确失败，不冒充 blocked
+        return _result(False, platform=platform, state="failed", error=_safe_error(exc))
 
 
 def easel_publish_status(platform: str = "") -> str:
     """读取 Easel 异步发布状态文件；不把启动或未知状态当作成功。"""
+    platform = _as_text(platform)
     targets = [platform] if platform else list(ACCOUNT_CONFIG)
+    if platform and platform not in ACCOUNT_CONFIG:
+        return _result(False, error="未知平台")
     rows = []
     for pf in targets:
         if pf not in ACCOUNT_CONFIG:
@@ -657,13 +738,18 @@ def easel_list_schedule() -> str:
 
 def easel_schedule_context(days: int = 14) -> str:
     """读取排期节奏和近期节点摘要。"""
-    cmd = [sys.executable, str(SCRIPTS / "calendar_ops.py"), "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(int(days or 14), 90)))]
+    days = _clamp_int(days, 1, 90)
+    cmd = [sys.executable, str(SCRIPTS / "calendar_ops.py"), "--data", str(SCHEDULE_FILE), "context", "--days", str(days)]
     try:
         rc, out, err = _run(cmd, timeout=30)
         data = _last_json(out)
-        return _result(rc == 0, data=data or {}, error=_safe_error(err[-500:]) if rc else "")
+        if rc != 0:
+            return _result(False, state="failed", data=data or {}, error=_safe_error(err[-500:]))
+        return _result(True, data=data or {})
+    except _SubprocessTimeout as exc:
+        return _result(False, state="unknown", error=_safe_error(exc))
     except Exception as exc:
-        return _result(False, error=_safe_error(exc))
+        return _result(False, state="unknown", error=_safe_error(exc))
 
 
 def easel_create_schedule(title: str, date: str, platform: str = "", time_text: str = "", status: str = "idea", note: str = "", confirmation_id: str = "") -> str:
@@ -760,6 +846,25 @@ def easel_delete_idea(idea_id: str, confirmation_id: str = "") -> str:
         return _result(deleted=idea_id)
     except Exception as exc:
         return _result(False, error=_safe_error(exc))
+
+
+# Every tool gets the same argument-shape contract: a malformed MCP argument
+# degrades to an ``ok=false`` envelope instead of an exception.
+_TOOL_NAMES = [
+    "easel_status", "easel_list_personas", "easel_read_persona", "easel_list_skills",
+    "easel_read_skill", "easel_skill_policy", "easel_request_skill_confirmation",
+    "easel_run_skill", "easel_list_outputs", "easel_read_output", "easel_list_accounts",
+    "easel_login_status", "easel_check_account", "easel_fetch_analytics",
+    "easel_get_publish_policy", "easel_plan_publish", "easel_request_manual_export",
+    "easel_export_manual_package", "easel_request_publish_confirmation", "easel_publish",
+    "easel_publish_status", "easel_request_write_confirmation", "easel_list_schedule",
+    "easel_schedule_context", "easel_create_schedule", "easel_update_schedule",
+    "easel_delete_schedule", "easel_list_ideas", "easel_create_idea",
+    "easel_update_idea", "easel_delete_idea",
+]
+for _name in _TOOL_NAMES:
+    globals()[_name] = _json_errors(globals()[_name])
+del _name
 
 
 def _schema_for_callable(fn: Any) -> dict[str, Any]:

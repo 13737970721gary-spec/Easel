@@ -1,4 +1,4 @@
-# Easel Web 启动器（本地回环）
+﻿# Easel Web 启动器（本地回环）
 # 用法：右键“使用 PowerShell 运行”，或 powershell -ExecutionPolicy Bypass -File run-easel.ps1
 # 停止：关闭该窗口，或 Stop-Process -Id (Get-NetTCPConnection -LocalPort 7860).OwningProcess
 param(

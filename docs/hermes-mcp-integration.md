@@ -61,6 +61,31 @@ Easel 的 114 个内置技能可以通过统一的 `easel_run_skill` 调用，�
 
 MCP 默认不满足第 1 条，因此真实发布默认被阻断。发布脚本退出码 0 也只表示已提交，`verified` 永远为 false，必须另行做平台读回对账，未知状态不改写为成功。
 
+## 状态词汇表
+
+`state` 字段只准取这四个值，语义互不重叠：
+
+| state | 含义 | 什么情况会返回 |
+| --- | --- | --- |
+| `submitted` | 已提交，未验证 | 发布脚本退出码 0 |
+| `failed` | 明确失败 | 退出码非 0、素材/参数校验不过、技能内部报错 |
+| `blocked` | 策略拒绝 | 主机发布闸关闭、确认凭证缺失或不匹配 |
+| `unknown` | 结果未知 | 子程序超时、输出无法解析、只读探测拿不到结论 |
+
+超时永远落在 `unknown`：它既不是平台拒绝（`failed`），也不是策略拒绝（`blocked`）。这条由 `_SubprocessTimeout` 强制，回归测试钉死。
+
+## 参数契约
+
+- 字符串参数传来非字符串 → `ok=false`，不静默按默认值跑；
+- 整数参数无法解析 → `ok=false`；超出范围 → 收敛到边界（`days`∈[1,90]、`limit`∈[1,500]、`max_chars`∈[100,100000]）；
+- 所有工具由 `_json_errors` 统一包裹，参数形态错误不会以堆栈形式冒到传输层。
+
+## 回归矩阵
+
+`tests/test_easel_mcp_tools.py` 对全部 31 个工具逐一做四条轴：成功 / 非法输入 / 子程序失败 / 子程序超时，外加协议层不变量（工具表与 schema、未知工具名、异常遏制、凭据剔除）。
+
+测试不联网、不碰真平台：`server._run` 被打桩，所有 Easel 状态路径由 `env` fixture 重定向到临时目录。该矩阵在首轮就抓出 5 个真实缺陷（超时被误报成失败/拒绝、`sessdata` 未被剔除、5 处参数类型崩溃、发布校验烧掉确认凭证、`easel_publish_status` 对未知平台静默返回空），已全部修复并有对应用例。
+
 ## 明确禁止
 
 - 不暴露 cookie、密码、AppSecret、token、环境变量或原始凭据文件；
@@ -93,8 +118,8 @@ hermes mcp test easel
 ✓ Connected
 ✓ Tools discovered: 31
 
-C:/Python314/python.exe -m pytest tests/test_easel_mcp_server.py -q
-12 passed
+C:/Python314/python.exe -m pytest tests/test_easel_mcp_tools.py tests/test_easel_mcp_server.py -q
+82 passed
 ```
 
 独立 stdio client 已完成 initialize、tools/list、`easel_status`、`easel_plan_publish` 往返验证。
