@@ -242,6 +242,41 @@ def test_read_persona_success_and_refusals(env):
     assert "格式无效" in call("easel_read_persona", name="a b")["error"]
 
 
+def test_list_skills_returns_real_descriptions_not_frontmatter(env):
+    rows = call("easel_list_skills")
+    assert rows["count"] == 114
+    placeholders = [r for r in rows["skills"]
+                    if not r["description"].strip() or set(r["description"].strip()) <= set("- ")]
+    assert placeholders == [], f"占位符描述：{[r['name'] for r in placeholders][:5]}"
+    copywriting = next(r for r in rows["skills"] if r["name"] == "copywriting")
+    assert "文案" in copywriting["description"]
+    assert "\n" not in copywriting["description"]
+
+
+def test_skill_description_parses_inline_and_block_forms(tmp_path):
+    inline = tmp_path / "a" / "SKILL.md"
+    inline.parent.mkdir(parents=True)
+    inline.write_text("---\nname: a\ndescription: 一句话描述\nlayer: produce\n---\n\n# A\n", encoding="utf-8")
+    assert server._skill_description(inline) == "一句话描述"
+
+    folded = tmp_path / "b" / "SKILL.md"
+    folded.parent.mkdir(parents=True)
+    folded.write_text("---\nname: b\ndescription: >\n  第一行\n  第二行\nlayer: produce\n---\n\n# B\n", encoding="utf-8")
+    assert server._skill_description(folded) == "第一行 第二行"
+
+    body = tmp_path / "c" / "SKILL.md"
+    body.parent.mkdir(parents=True)
+    body.write_text("# C\n\n正文第一行\n", encoding="utf-8")
+    assert server._skill_description(body) == "正文第一行"
+
+    empty = tmp_path / "d" / "SKILL.md"
+    empty.parent.mkdir(parents=True)
+    empty.write_text("", encoding="utf-8")
+    assert server._skill_description(empty) == ""
+
+    assert server._skill_description(tmp_path / "missing" / "SKILL.md") == ""
+
+
 def test_list_skills_reports_full_catalog(env):
     rows = call("easel_list_skills")
     assert rows["ok"] is True and rows["count"] == 114

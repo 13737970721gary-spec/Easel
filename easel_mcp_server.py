@@ -430,6 +430,52 @@ def easel_read_persona(name: str) -> str:
     return _result(persona=name, files=files)
 
 
+def _skill_description(skill_md: Path) -> str:
+    """从 SKILL.md 取一行技能描述。
+
+    这些文件都带 YAML frontmatter，真正的描述在 ``description:`` 字段里
+    （常是 ``>`` 折叠块）。早先的"第一个非 # 行"逻辑只会拿到 frontmatter
+    的 ``---`` 分隔符，114 个技能的描述全是占位符。
+    """
+    try:
+        text = skill_md.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    body_start = 0
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                body_start = index + 1
+                break
+        front = lines[1:body_start - 1] if body_start else []
+        collected: list[str] = []
+        key_indent = 0
+        for index, line in enumerate(front):
+            stripped = line.strip()
+            if not collected:
+                if stripped.startswith("description:"):
+                    key_indent = len(line) - len(line.lstrip())
+                    value = stripped.split(":", 1)[1].strip()
+                    if value in {">", ">-", "|", "|-", ""}:
+                        collected = [""]
+                    else:
+                        return " ".join(value.split())[:180]
+            else:
+                indent = len(line) - len(line.lstrip())
+                if line.strip() and indent > key_indent:
+                    collected.append(line.strip())
+                else:
+                    break
+        if collected:
+            return " ".join(" ".join(collected).split())[:180]
+    for line in lines[body_start:]:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped[:180]
+    return ""
+
+
 def easel_list_skills(query: str = "") -> str:
     """列出 Easel 内置技能；可按名称过滤。"""
     q = _as_text(query).lower().strip()
@@ -438,13 +484,8 @@ def easel_list_skills(query: str = "") -> str:
         if not p.is_dir() or (q and q not in p.name.lower()):
             continue
         skill = p / "SKILL.md"
-        desc = ""
-        if skill.is_file():
-            for line in skill.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if line.strip() and not line.startswith("#"):
-                    desc = line.strip()[:180]
-                    break
-        rows.append({"name": p.name, "has_skill_md": skill.is_file(), "description": desc})
+        rows.append({"name": p.name, "has_skill_md": skill.is_file(),
+                     "description": _skill_description(skill) if skill.is_file() else ""})
     return _result(skills=rows, count=len(rows))
 
 
